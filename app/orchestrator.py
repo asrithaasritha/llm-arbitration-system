@@ -1,40 +1,36 @@
 """
 LangGraph orchestration: runs the 3 critics in parallel, detects
-disagreements between them, and hands everything to the adjudicator.
+disagreements between them, then sends everything to the adjudicator
+for a final verdict.
 """
 
 from typing import TypedDict
 from langgraph.graph import StateGraph, START, END
 
-from app.models import Critique, Disagreement
+from app.models import Critique, Disagreement, Verdict
 from app.critics import run_accuracy_critic, run_logic_critic, run_completeness_critic
+from app.adjudicator import run_adjudicator
 
 
 class ArbitrationState(TypedDict):
-    """
-    The shared 'clipboard' passed between every node in the graph.
-    Each node reads what it needs and writes its result back in.
-    """
+    """The shared 'clipboard' passed between every node in the graph."""
     original_question: str
     output_to_evaluate: str
     accuracy_critique: Critique | None
     logic_critique: Critique | None
     completeness_critique: Critique | None
     disagreements: list[Disagreement]
+    verdict: Verdict | None
 
 
 # ---- Node functions ----
-# Each node takes the current state, does its job, and returns
-# a dict of updates to merge back into the state.
 
 def accuracy_node(state: ArbitrationState) -> dict:
-    critique = run_accuracy_critic(state["output_to_evaluate"])
-    return {"accuracy_critique": critique}
+    return {"accuracy_critique": run_accuracy_critic(state["output_to_evaluate"])}
 
 
 def logic_node(state: ArbitrationState) -> dict:
-    critique = run_logic_critic(state["output_to_evaluate"])
-    return {"logic_critique": critique}
+    return {"logic_critique": run_logic_critic(state["output_to_evaluate"])}
 
 
 def completeness_node(state: ArbitrationState) -> dict:
@@ -45,17 +41,12 @@ def completeness_node(state: ArbitrationState) -> dict:
 
 
 def detect_disagreements_node(state: ArbitrationState) -> dict:
-    """
-    Compares the 3 critics' scores. If the spread between the
-    highest and lowest score is >= 2, that's a real disagreement
-    worth flagging for the adjudicator to resolve.
-    """
+    """Flags a disagreement if the highest/lowest critic scores differ by >= 2."""
     critiques = {
         "accuracy": state["accuracy_critique"],
         "logic": state["logic_critique"],
         "completeness": state["completeness_critique"],
     }
-
     scores = {dim: c.score for dim, c in critiques.items()}
     highest_dim = max(scores, key=scores.get)
     lowest_dim = min(scores, key=scores.get)
@@ -75,8 +66,18 @@ def detect_disagreements_node(state: ArbitrationState) -> dict:
                 severity_gap=spread,
             )
         )
-
     return {"disagreements": disagreements}
+
+
+def adjudicator_node(state: ArbitrationState) -> dict:
+    verdict = run_adjudicator(
+        output_to_evaluate=state["output_to_evaluate"],
+        accuracy=state["accuracy_critique"],
+        logic=state["logic_critique"],
+        completeness=state["completeness_critique"],
+        disagreements=state["disagreements"],
+    )
+    return {"verdict": verdict}
 
 
 # ---- Build the graph ----
@@ -88,21 +89,21 @@ def build_graph():
     graph.add_node("logic", logic_node)
     graph.add_node("completeness", completeness_node)
     graph.add_node("detect_disagreements", detect_disagreements_node)
+    graph.add_node("adjudicator", adjudicator_node)
 
-    # Parallel fan-out: START connects to all 3 critics at once.
-    # LangGraph runs all nodes reachable from START with no
-    # dependency between them concurrently.
+    # Parallel fan-out: all 3 critics start simultaneously from START
     graph.add_edge(START, "accuracy")
     graph.add_edge(START, "logic")
     graph.add_edge(START, "completeness")
 
-    # Fan-in: detect_disagreements waits until ALL THREE critics
-    # have finished before it runs.
+    # Fan-in: wait for all 3 critics before detecting disagreements
     graph.add_edge("accuracy", "detect_disagreements")
     graph.add_edge("logic", "detect_disagreements")
     graph.add_edge("completeness", "detect_disagreements")
 
-    graph.add_edge("detect_disagreements", END)
+    # Sequential: adjudicator runs last, after disagreements are known
+    graph.add_edge("detect_disagreements", "adjudicator")
+    graph.add_edge("adjudicator", END)
 
     return graph.compile()
 
@@ -112,8 +113,6 @@ if __name__ == "__main__":
 
     app = build_graph()
 
-    # A case DESIGNED to make critics disagree:
-    # factually correct, but the reasoning connecting cause -> effect is broken.
     test_question = "Why did the company's stock price rise after the earnings call?"
     test_output = (
         "The company's stock rose 12% after the earnings call. Apple was "
@@ -129,20 +128,17 @@ if __name__ == "__main__":
         "logic_critique": None,
         "completeness_critique": None,
         "disagreements": [],
+        "verdict": None,
     })
     elapsed = time.time() - t0
 
-    print(f"(pipeline took {elapsed:.1f}s -- proves critics ran in parallel)\n")
-
-    print("=== ACCURACY ===")
-    print(result["accuracy_critique"].model_dump_json(indent=2))
-    print("\n=== LOGIC ===")
-    print(result["logic_critique"].model_dump_json(indent=2))
-    print("\n=== COMPLETENESS ===")
-    print(result["completeness_critique"].model_dump_json(indent=2))
-    print("\n=== DISAGREEMENTS ===")
+    print(f"(full pipeline took {elapsed:.1f}s)\n")
+    print("=== DISAGREEMENTS ===")
     if result["disagreements"]:
         for d in result["disagreements"]:
             print(d.model_dump_json(indent=2))
     else:
         print("None detected this run.")
+
+    print("\n=== FINAL VERDICT ===")
+    print(result["verdict"].model_dump_json(indent=2))
