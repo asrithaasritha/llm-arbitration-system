@@ -1,4 +1,4 @@
-# ⚖️ LLM Arbitration System
+# LLM Arbitration System
 
 **Multi-agent evaluation for AI outputs.** Three independent critics judge accuracy, logic, and completeness in parallel; an adjudicator resolves their disagreements into one auditable verdict.
 
